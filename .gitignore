@@ -63,3 +63,5 @@ nunit-*.xml
 # nuclear option
 # I would rather not include it
 .idea
+
+BenchmarkDotNet.Artifacts
