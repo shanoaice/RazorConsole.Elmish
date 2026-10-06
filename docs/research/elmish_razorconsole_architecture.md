@@ -30,7 +30,7 @@ RazorConsole enables rendering Blazor / Razor components directly into terminal 
 |   |   Dispatcher: Dispatcher.CreateDefault()                                      |   |
 |   |   Component Roots: Dictionary<int, VNode>                                     |   |
 |   |                                                                               |   |
-|   |   MountComponentAsync() --------> RenderRootComponentAsync(componentId)      |   |
+|   |   MountComponentAsync() --------> RenderRootComponentAsync(componentId)       |   |
 |   |                                               |                               |   |
 |   |                                               v                               |   |
 |   |   UpdateDisplayAsync(in RenderBatch batch)    |                               |   |
@@ -462,332 +462,199 @@ A clean, lightweight, native `RazorConsole.Elmish` library provides:
 
 ---
 
-### 5.2 Concrete Implementation Design
+### 5.2 Architectural Contracts and Implementation Hints
 
-Here is the complete production-grade architectural design for `RazorConsole.Elmish`.
+Rather than prescribing rigid implementation code, the connector architecture is defined through its core contracts, type signatures, and implementation guidance.
 
-#### Module 1: The Core Program Component (`ElmishProgramComponent.fs`)
+#### 1. Core Component Contract (`ElmishProgramComponent<'model, 'msg>`)
+The base component bridges the Elmish loop and Blazor's lifecycle within RazorConsole:
+
 ```fsharp
-namespace RazorConsole.Elmish
-
-open System
-open System.Threading.Tasks
-open Microsoft.AspNetCore.Components
-open Microsoft.AspNetCore.Components.Rendering
-open Elmish
-
-/// <summary>
-/// A Blazor component that hosts an Elmish (MVU) program inside RazorConsole.
-/// </summary>
 [<AbstractClass>]
-type ElmishProgramComponent<'model, 'msg>() as this =
+type ElmishProgramComponent<'model, 'msg>() =
     inherit ComponentBase()
 
-    let mutable currentModel: 'model option = None
-    let mutable currentView: RenderFragment = RenderFragment(fun _ -> ())
-    let mutable dispatch: Dispatch<'msg> = ignore
-    let mutable program: Program<ElmishProgramComponent<'model, 'msg>, 'model, 'msg, RenderFragment> option = None
-    let mutable started = false
-
-    /// <summary>The Elmish program definition.</summary>
+    /// Abstract program specification defined by the consumer
     abstract Program: Program<ElmishProgramComponent<'model, 'msg>, 'model, 'msg, RenderFragment>
 
-    /// <summary>Dispatches a message to the Elmish loop safely on the Blazor dispatcher.</summary>
-    member this.Dispatch(msg: 'msg) =
-        this.InvokeAsync(fun () -> dispatch msg) |> ignore
+    /// Thread-safe message dispatch marshaled onto Blazor's dispatcher
+    member Dispatch: 'msg -> unit
 
-    /// <summary>Compares old and new models to avoid redundant renders.</summary>
+    /// Model equality predicate controlling re-renders (defaults to ReferenceEquals)
     abstract ShouldRender: oldModel: 'model * newModel: 'model -> bool
-    default _.ShouldRender(oldModel, newModel) =
-        not (obj.ReferenceEquals(oldModel, newModel))
 
-    override this.OnInitialized() =
-        base.OnInitialized()
-        let theProgram = this.Program
-
-        // Initialize state
-        let initModel, initCmd = Program.init theProgram this
-        currentModel <- Some initModel
-        currentView <- Program.view theProgram initModel this.Dispatch
-
-        // Set up the state change hook
-        let setState (model: 'model) (d: Dispatch<'msg>) =
-            let shouldUpdate =
-                match currentModel with
-                | Some oldModel -> this.ShouldRender(oldModel, model)
-                | None -> true
-
-            if shouldUpdate then
-                currentModel <- Some model
-                currentView <- Program.view theProgram model d
-                this.InvokeAsync(this.StateHasChanged) |> ignore
-
-        // Map program to capture dispatch and wire setState
-        let mappedProgram =
-            theProgram
-            |> Program.map
-                (fun init arg ->
-                    let m, c = init arg
-                    m, [ fun d -> dispatch <- d ] @ c)
-                id
-                id
-                (fun _ model d -> setState model d)
-                id
-                id
-
-        program <- Some mappedProgram
-
-    override this.OnAfterRenderAsync(firstRender: bool) =
-        task {
-            if firstRender && not started then
-                started <- true
-                match program with
-                | Some p -> Program.runWith this p
-                | None -> ()
-        }
-
-    override this.BuildRenderTree(builder: RenderTreeBuilder) =
-        base.BuildRenderTree(builder)
-        currentView.Invoke(builder)
-
-    interface IDisposable with
-        member _.Dispose() =
-            // Clean up subscriptions or program resources
-            ()
+    // Lifecycle overrides:
+    override OnInitialized: unit -> unit
+    override OnAfterRenderAsync: firstRender: bool -> Task
+    override BuildRenderTree: builder: RenderTreeBuilder -> unit
 ```
+
+**Implementation Hints:**
+- **Initialization (`OnInitialized`):**  
+  Run `Program.init` to produce the initial model and commands. Render the initial view immediately to `currentView` so that the first render pass has content.
+- **State Interception (`setState`):**  
+  Use `Program.map` to intercept Elmish's `setState`. When Elmish emits an updated model:
+  1. Check `this.ShouldRender(oldModel, newModel)`.
+  2. Recompute `currentView <- Program.view program newModel dispatch`.
+  3. **Critical:** Call `this.InvokeAsync(this.StateHasChanged)` to marshal the render request onto Blazor's `Dispatcher`. Commands and subscriptions run on thread pool threads; bypassing `InvokeAsync` will cause concurrency violations in the renderer.
+- **Loop Start (`OnAfterRenderAsync`):**  
+  Do not start `Program.runWith` during `OnInitialized`. Start it when `firstRender` is true in `OnAfterRenderAsync`. This matches Blazor's interactive startup model (and Bolero's pattern) so that initial commands and subscriptions begin only after the root component is mounted.
+- **Tree Building (`BuildRenderTree`):**  
+  Simply invoke the latest `currentView.Invoke(builder)`.
 
 ---
 
-#### Module 2: The Type-Safe F# Terminal View DSL (`View.fs`)
+#### 2. Declarative View Contract (`View.fs`)
+The view layer produces `RenderFragment` delegates (`builder -> unit`) wrapping RazorConsole's components:
+
 ```fsharp
-namespace RazorConsole.Elmish
-
-open System
-open Microsoft.AspNetCore.Components
-open Microsoft.AspNetCore.Components.Rendering
-open Spectre.Console
-open RazorConsole.Components
-
-/// <summary>
-/// Functions for constructing declarative RazorConsole render trees.
-/// </summary>
 module View =
-
     type View = RenderFragment
 
-    /// <summary>Empty view node.</summary>
-    let empty : View = RenderFragment(fun _ -> ())
-
-    /// <summary>Renders plain text content.</summary>
-    let text (content: string) : View =
-        RenderFragment(fun b -> b.AddContent(0, content))
-
-    /// <summary>Renders Spectre.Console markup text.</summary>
-    let markup (content: string) : View =
-        RenderFragment(fun b ->
-            b.OpenComponent<Markup>(0)
-            b.AddAttribute(1, "Content", content)
-            b.CloseComponent()
-        )
-
-    /// <summary>Renders a Panel component wrapping child content.</summary>
-    let panel
-        (title: string option)
-        (border: BoxBorder option)
-        (borderColor: Color option)
-        (child: View) : View =
-        RenderFragment(fun b ->
-            b.OpenComponent<Panel>(0)
-            title |> Option.iter (fun t -> b.AddAttribute(1, "Title", t))
-            border |> Option.iter (fun brd -> b.AddAttribute(2, "Border", brd))
-            borderColor |> Option.iter (fun c -> b.AddAttribute(3, "BorderColor", Nullable c))
-            b.AddAttribute(4, "ChildContent", child)
-            b.CloseComponent()
-        )
-
-    /// <summary>Renders an interactive TextInput component with two-way binding mapped to Elmish messages.</summary>
-    let textInput
-        (value: string)
-        (placeholder: string option)
-        (onChanged: string -> 'msg)
-        (dispatch: Dispatch<'msg>) : View =
-        RenderFragment(fun b ->
-            b.OpenComponent<TextInput>(0)
-            b.AddAttribute(1, "Value", value)
-            placeholder |> Option.iter (fun p -> b.AddAttribute(2, "Placeholder", p))
-            let callback = EventCallback.Factory.Create<string>(
-                b,
-                Action<string>(fun v -> dispatch (onChanged v))
-            )
-            b.AddAttribute(3, "ValueChanged", callback)
-            b.CloseComponent()
-        )
-
-    /// <summary>Renders vertical rows of child views.</summary>
-    let rows (children: View list) : View =
-        RenderFragment(fun b ->
-            b.OpenComponent<Rows>(0)
-            let childContent = RenderFragment(fun cb ->
-                let mutable seq = 0
-                for child in children do
-                    cb.AddContent(seq, child)
-                    seq <- seq + 1
-            )
-            b.AddAttribute(1, "ChildContent", childContent)
-            b.CloseComponent()
-        )
-
-    /// <summary>Renders horizontal columns of child views.</summary>
-    let columns (children: View list) : View =
-        RenderFragment(fun b ->
-            b.OpenComponent<Columns>(0)
-            let childContent = RenderFragment(fun cb ->
-                let mutable seq = 0
-                for child in children do
-                    cb.AddContent(seq, child)
-                    seq <- seq + 1
-            )
-            b.AddAttribute(1, "ChildContent", childContent)
-            b.CloseComponent()
-        )
-
-    /// <summary>Renders a Figlet banner.</summary>
-    let figlet (text: string) (color: Color option) : View =
-        RenderFragment(fun b ->
-            b.OpenComponent<Figlet>(0)
-            b.AddAttribute(1, "Text", text)
-            color |> Option.iter (fun c -> b.AddAttribute(2, "Color", Nullable c))
-            b.CloseComponent()
-        )
-
-    /// <summary>Combines multiple views sequentially.</summary>
-    let concat (views: View list) : View =
-        RenderFragment(fun b ->
-            let mutable seq = 0
-            for v in views do
-                b.AddContent(seq, v)
-                seq <- seq + 1
-        )
+    val empty: View
+    val text: string -> View
+    val markup: string -> View
+    val panel: title: string option -> border: BoxBorder option -> borderColor: Color option -> child: View -> View
+    val rows: children: View list -> View
+    val columns: children: View list -> View
+    val textInput: value: string -> placeholder: string option -> onChanged: (string -> 'msg) -> dispatch: ('msg -> unit) -> View
+    val button: content: string -> onClick: 'msg -> dispatch: ('msg -> unit) -> View
 ```
+
+**Implementation Hints:**
+- **Component Frames:** Use `builder.OpenComponent<TComponent>(seq)`, `builder.AddAttribute(seq, "Name", box value)`, and `builder.CloseComponent()`.
+- **Sequence Numbers:** For static wrapper functions, hardcode sequence numbers (`0`, `1`, `2`...) corresponding to source call sites as recommended by Microsoft's [RenderTreeBuilder guide](https://learn.microsoft.com/en-us/aspnet/core/blazor/advanced-scenarios).
+- **Event Callbacks:** To bind events (like `ValueChanged` on `TextInput` or `OnClick` on `TextButton`), use `EventCallback.Factory.Create<'T>(builder, Action<'T>(fun v -> dispatch (msgCreator v)))`. RazorConsole's keyboard and focus managers trigger these callbacks automatically upon user interaction.
 
 ---
 
-#### Module 3: Generic Host Integration (`HostExtensions.fs`)
+#### 3. Generic Host Integration Contract
+Provide standard extension methods for `IHostBuilder` and `IHostApplicationBuilder`:
+
 ```fsharp
-namespace RazorConsole.Elmish
-
-open System.Runtime.CompilerServices
-open Microsoft.Extensions.Hosting
-open RazorConsole.Core
-
 [<Extension>]
 type HostBuilderExtensions =
-
-    /// <summary>
-    /// Configures the HostBuilder to run a RazorConsole Elmish application.
-    /// </summary>
     [<Extension>]
     static member UseRazorConsoleElmish<'TComponent, 'model, 'msg
-        when 'TComponent :> ElmishProgramComponent<'model, 'msg> and 'TComponent : (new : unit -> 'TComponent)>
-        (builder: IHostBuilder) =
-        builder.UseRazorConsole<'TComponent>()
-
-    /// <summary>
-    /// Configures the HostApplicationBuilder to run a RazorConsole Elmish application.
-    /// </summary>
-    [<Extension>]
-    static member UseRazorConsoleElmish<'TComponent, 'model, 'msg
-        when 'TComponent :> ElmishProgramComponent<'model, 'msg> and 'TComponent : (new : unit -> 'TComponent)>
-        (builder: IHostApplicationBuilder) =
-        builder.UseRazorConsole<'TComponent>()
+        when 'TComponent :> ElmishProgramComponent<'model, 'msg> and 'TComponent : (new: unit -> 'TComponent)>
+        : builder: IHostBuilder -> IHostBuilder
 ```
+
+**Implementation Hints:**
+- Forward directly to `RazorConsole.Core`'s `builder.UseRazorConsole<'TComponent>()`. RazorConsole's `ComponentService<TComponent>` will mount your `ElmishProgramComponent` as the application's root component.
 
 ---
 
-#### Module 4: Complete Working Example Application
-Here is what a developer writes to build a full terminal app:
-```fsharp
-namespace MyApp
+### 5.3 Step-by-Step Implementation Roadmap
 
-open System
-open Spectre.Console
-open Elmish
-open RazorConsole.Elmish
-open RazorConsole.Elmish.View
+A structured, 5-phase plan to implement and verify `RazorConsole.Elmish`:
 
-// 1. Model
-type Model = {
-    UserName: string
-    Counter: int
-    Status: string
-}
-
-// 2. Messages
-type Msg =
-    | NameChanged of string
-    | Increment
-    | Decrement
-    | Reset
-
-// 3. Init & Update
-module App =
-    let init () : Model * Cmd<Msg> =
-        { UserName = "Terminal Explorer"; Counter = 0; Status = "Ready" }, Cmd.none
-
-    let update (msg: Msg) (model: Model) : Model * Cmd<Msg> =
-        match msg with
-        | NameChanged name ->
-            { model with UserName = name; Status = sprintf "Name set to %s" name }, Cmd.none
-        | Increment ->
-            { model with Counter = model.Counter + 1; Status = "Incremented" }, Cmd.none
-        | Decrement ->
-            { model with Counter = model.Counter - 1; Status = "Decremented" }, Cmd.none
-        | Reset ->
-            { model with Counter = 0; Status = "Reset to 0" }, Cmd.none
-
-    // 4. View function producing RazorConsole View (RenderFragment)
-    let view (model: Model) (dispatch: Dispatch<Msg>) : View =
-        rows [
-            figlet "ELMISH TUI" (Some Color.Cyan1)
-
-            panel (Some "User Settings") (Some BoxBorder.Rounded) (Some Color.Green) (
-                rows [
-                    markup (sprintf "[bold]Current User:[/][yellow] %s[/]" model.UserName)
-                    textInput model.UserName (Some "Enter your name...") NameChanged dispatch
-                ]
-            )
-
-            panel (Some "Counter Dashboard") (Some BoxBorder.Double) (Some Color.Blue) (
-                rows [
-                    markup (sprintf "[bold]Count:[/] [bold green]%d[/]" model.Counter)
-                    markup (sprintf "[italic]Status:[/] [grey]%s[/]" model.Status)
-                    columns [
-                        markup "[dim](Press Up/Down to navigate inputs)[/]"
-                    ]
-                ]
-            )
-        ]
-
-// 5. Root Component
-type TerminalAppRoot() =
-    inherit ElmishProgramComponent<Model, Msg>()
-
-    override _.Program =
-        Program.mkProgram App.init App.update App.view
-
-// 6. Program Entry Point
-module Program =
-    open Microsoft.Extensions.Hosting
-
-    [<EntryPoint>]
-    let main args =
-        Host.CreateDefaultBuilder(args)
-            .UseRazorConsoleElmish<TerminalAppRoot, _, _>()
-            .Build()
-            .Run()
-        0
 ```
++-----------------------------------------------------------------------------------+
+|                              Implementation Roadmap                               |
+|                                                                                   |
+|   [Phase 1] Project Setup & Dependencies                                          |
+|             * Create F# classlib & sample console app                             |
+|             * Reference Elmish, Microsoft.AspNetCore.Components, RazorConsole.Core |
+|                                     │                                             |
+|                                     ▼                                             |
+|   [Phase 2] Core Runtime Bridge (ElmishProgramComponent)                          |
+|             * Implement ComponentBase subclass                                    |
+|             * Wire Program.init, setState, InvokeAsync, and runWith               |
+|             * Smoke-test with a raw RenderFragment counter                        |
+|                                     │                                             |
+|                                     ▼                                             |
+|   [Phase 3] High-Level View Combinators (View.fs)                                 |
+|             * Wrap core components: Panel, Rows, Columns, Markup, TextInput       |
+|             * Verify EventCallback bindings with terminal input                   |
+|                                     │                                             |
+|                                     ▼                                             |
+|   [Phase 4] Computation Expression DSL (Dsl.fs)                                   |
+|             * Implement Container Builders (rows, columns) with Yield / For       |
+|             * Implement Component Builders (panel, box) with Custom Operations    |
+|             * Implement Input Builders (textInput, button)                        |
+|                                     │                                             |
+|                                     ▼                                             |
+|   [Phase 5] Verification, Focus, and Edge Cases                                   |
+|             * Tab navigation & focus ring validation                              |
+|             * Async commands & timer subscriptions (concurrency marshaling)       |
+|             * Terminal resize behavior                                            |
++-----------------------------------------------------------------------------------+
+```
+
+#### Phase 1: Project Setup & Dependencies
+1. Initialize an F# class library (`RazorConsole.Elmish`) targeting `.NET 8.0` / `.NET 9.0`.
+2. Reference `Elmish` (v4.x), `Microsoft.AspNetCore.Components`, and `RazorConsole.Core`.
+3. Create a companion console sample project (`samples/CounterApp`) to exercise the library continuously during development.
+
+#### Phase 2: Core Runtime Bridge (ElmishProgramComponent)
+- **Milestone:** Verify the MVU dispatch loop inside RazorConsole before writing any DSL.
+- Implement `ElmishProgramComponent<'model, 'msg>` inheriting `ComponentBase`.
+- Wire `OnInitialized` to extract the initial model and capture `dispatch`.
+- Intercept `setState` and dispatch notifications through `this.InvokeAsync(this.StateHasChanged)`.
+- Start the Elmish loop (`Program.runWith`) inside `OnAfterRenderAsync` when `firstRender = true`.
+- **Verification:** Write a minimal counter app using a raw `RenderFragment` writing an `<h1>` element. Confirm that incrementing a counter re-renders the terminal screen without exceptions.
+
+#### Phase 3: High-Level View Combinators (View.fs)
+- **Milestone:** Provide type-safe functional wrappers for RazorConsole's terminal components.
+- Implement wrappers for:
+  - `<Markup>` (rich text formatting).
+  - `<Panel>` and `<Box>` (borders, titles, padding).
+  - `<Rows>` and `<Columns>` (layout containers).
+  - `<TextInput>` (two-way binding via `ValueChanged`).
+  - `<TextButton>` (click handlers via `OnClick`).
+- Implement the supported HTML convenience module (`View.Html.p`, `View.Html.table`, `View.Html.hr`).
+- **Verification:** Build a two-input form with a button and verify that typing and button clicks dispatch messages correctly.
+
+#### Phase 4: Computation Expression DSL (Dsl.fs)
+- **Milestone:** Replace list-bracket noise with declarative `{ ... }` syntax and custom operations.
+- **Container Builders:** Create builders for `rows` and `columns` implementing `Yield`, `Combine`, `Delay`, `Run`, `Zero`, and `For` (to allow `for item in items do ...`).
+- **Widget Builders:** Create builders for `panel`, `box`, `grid` equipped with `[<CustomOperation>]` attributes for `title`, `border`, `borderColor`, `padding`, `expand`, etc.
+- **Input Builders:** Create builders for `textInput` and `button` with operations for `value`, `placeholder`, `onChange`, and `onClick`.
+- **Verification:** Author a multi-section dashboard using exclusively the CE DSL syntax.
+
+#### Phase 5: Verification, Focus, and Edge Cases
+- **Keyboard & Focus:** Verify that `Tab` and `Shift+Tab` navigate between multiple `textInput` and `button` elements, and that focus highlights change as expected.
+- **Asynchronous Commands:** Add async commands (`Cmd.OfAsync.perform` / `Cmd.OfTask.perform`) to test that model updates originating from background threads marshal onto the Blazor dispatcher without throwing.
+- **Terminal Resizing:** Resize the terminal emulator while running to confirm that RazorConsole's `TerminalMonitor` triggers re-measurement without breaking Elmish state.
+
 ---
+
+### 5.4 Empirical Performance Evaluation: RenderFragment vs. Direct RenderTreeBuilder
+
+A central architectural question for `RazorConsole.Elmish` is whether the Elmish `view` function should emit a tree of Blazor components via `RenderFragment` delegates, or directly drive `RenderTreeBuilder.OpenElement` inside a single root component.
+
+#### 1. Resolution of the Initial "16× Slower" Benchmark Anomaly
+Early prototype benchmarks initially produced a puzzling result:
+* *Flawed Early Result:* Component Path reported ~15.5 μs (12 KB), while Direct Element reported ~251.8 μs (225 KB), leading to the premature hypothesis that direct elements were "16× slower".
+* *Investigation & Root Cause:* The early benchmark had two critical flaws:
+  1. **Asymmetric Update Propagation:** The component path's child components were not receiving updated parameters, causing Blazor to silently short-circuit and skip re-rendering child components. It measured a virtually no-op parent render.
+  2. **VDOM Structure Divergence:** The direct element path omitted layout attributes and text spans, testing an entirely different element structure against RazorConsole's translator.
+
+#### 2. Normalized Empirical Findings (Identical VDOM Verification)
+When the harness was normalized so that both approaches generate **100% character-identical Virtual DOM trees** across all frames (verified via `VdomHtmlSerializer` string assertions), the true performance relationship emerged:
+
+```
+Normalized Results (BenchmarkDotNet v0.15.8, .NET 10.0.12, RyuJIT x86-64-v3)
+
+[PureBlazor Mode - Factoring out Spectre / VDOM overhead]
+  Component Tree (Full Update: 50 items):   65.19 μs |  32.99 KB
+  Direct Builder (Full Update: 50 items):   17.10 μs |   9.46 KB  (3.81x faster, -71% memory)
+
+[ConsoleRenderer Mode - Full in-memory RazorConsole pipeline]
+  Component Tree (Full Update: 50 items):  217.87 μs | 274.75 KB
+  Direct Builder (Full Update: 50 items):  157.00 μs | 243.54 KB  (1.39x faster, -11% memory)
+```
+
+#### 3. Architectural Synthesis
+1. **Direct `RenderTreeBuilder` is faster and leaner:** In pure Blazor execution, bypassing component lifecycles, parameter diffing, and delegate closures is **3.8x faster** and cuts allocations by **71%**.
+2. **Spectre Widget Translation Dominates:** In the full RazorConsole pipeline, `ConsoleRenderer.CreateSnapshot()` introduces a ~140 μs / 230 KB translation baseline. This fixed overhead dampens the visible speedup to ~1.4x.
+3. **Elmish Alignment:** Direct builder emission aligns naturally with Elmish's single-state unidirectional architecture. However, to host third-party or interactive C# Blazor components, an escape hatch (`comp<TComponent>`) remains essential.
+
+*(See Section 7 for the complete benchmark matrix, partial update analysis, structural mutation metrics, and concrete 60 FPS optimization guidelines.)*
+
+---
+
 
 ## 6. HTML Support Matrix & Computation Expression (CE) DSL Analysis
 
@@ -995,10 +862,218 @@ let view (model: Model) (dispatch: Dispatch<Msg>) : View =
 
 ---
 
-## 7. Primary Source Citation Index
+## 7. Performance Engineering & 60 FPS TUI Optimization Guide
+
+A 60 FPS terminal user interface requires each frame to complete its end-to-end execution—from model update to terminal rasterization—within **16.67 milliseconds (16,666 μs)**. More critically, high-frequency TUIs must control **managed memory allocations** to prevent Gen 0/1 garbage collection pauses from introducing visual stutter and frame drops.
+
+This section details empirical findings and actionable optimization strategies across all layers of the `RazorConsole.Elmish` architecture.
+
+---
+
+### 7.1 Empirical Benchmark Findings: Direct RenderTreeBuilder vs. Component Tree
+
+To establish an empirical baseline, we implemented an in-depth benchmark comparing:
+1. **Component Tree Model**: Idiomatic Blazor composition (`Rows -> Panel -> Markup`) with nested `RenderFragment` delegates.
+2. **Direct `RenderTreeBuilder` Model**: A single root component emitting flat VDOM elements directly (`OpenElement`, `AddAttribute`, `CloseElement`).
+
+Both paths were verified to produce **100% character-identical Virtual DOM trees** across three distinct mutation scenarios, measured under two pipeline modes:
+* **`PureBlazor`**: Isolates pure Blazor tree diffing by using a no-op renderer, completely factoring out Spectre.Console and VDOM translation overhead.
+* **`ConsoleRenderer`**: Evaluates the full in-memory RazorConsole pipeline (Blazor diffing + VNode tree synchronization + Spectre widget translation).
+
+#### Benchmark Results (BenchmarkDotNet v0.15.8, .NET 10.0.12, RyuJIT x86-64-v3)
+
+| Scenario | Mode | Component Tree Mean | Direct Builder Mean | Speedup | Component Tree Alloc | Direct Builder Alloc | Alloc Reduction |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Full Update (50 items)** | `PureBlazor` | 65.19 μs | **17.10 μs** | **3.81x** | 32.99 KB | **9.46 KB** | **-71.3%** |
+| **Partial Update (1 of 50 items)** | `PureBlazor` | 51.10 μs | **15.70 μs** | **3.25x** | 19.66 KB | **8.38 KB** | **-57.4%** |
+| **Structural Mutation (50 ↔ 51)** | `PureBlazor` | 62.42 μs | **17.87 μs** | **3.49x** | 27.95 KB | **9.55 KB** | **-65.8%** |
+| **Full Update (50 items)** | `ConsoleRenderer` | 217.87 μs | **157.00 μs** | **1.39x** | 274.75 KB | **243.54 KB** | **-11.4%** |
+| **Partial Update (1 of 50 items)** | `ConsoleRenderer` | 195.85 μs | **140.90 μs** | **1.39x** | 251.01 KB | **226.70 KB** | **-9.7%** |
+| **Structural Mutation (50 ↔ 51)** | `ConsoleRenderer` | 210.43 μs | **148.40 μs** | **1.42x** | 269.33 KB | **237.68 KB** | **-11.8%** |
+
+#### Key Empirical Insights
+1. **Pure Tree-Building Speed:** In isolation, direct `RenderTreeBuilder` emission is **3.3x to 3.8x faster** and allocates **~70% less memory** than a component hierarchy.
+2. **Component Boundary Penalty on Partial Updates:** Even when only 1 item out of 50 changes, the Component Tree still takes **51.10 μs** in `PureBlazor`. Because `ChildContent` delegates are re-instantiated closures, Blazor cannot prove parameter equality and forces `SetParametersAsync` traversals across all 50 components. In contrast, Direct Builder completes in **15.70 μs** because Blazor diffs the single tree in memory and generates **0 edits** for the 49 unchanged items.
+3. **Amdahl's Law in RazorConsole:** Under `ConsoleRenderer`, widget translation (`CreateSnapshot`) adds a flat baseline cost of **~135–150 μs** and **~230 KB of allocations** per frame to both approaches. This fixed overhead compresses the observed speedup from **3.8x** down to **1.4x**.
+
+---
+
+### 7.2 Beyond RenderTreeBuilder: High-Impact Performance Optimization Levers
+
+Choosing direct `RenderTreeBuilder` emission resolves the tree-generation bottleneck. To squeeze out maximum performance for a sustained 60 FPS TUI, optimizations must be applied across four additional architectural dimensions:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 The 60 FPS Performance Optimization Matrix                  │
+├──────────────────────────┬──────────────────────────────────────────────────┤
+│ 1. Elmish Dispatch Loop  │ Frame Throttling, Message Coalescing, Lazy Views │
+├──────────────────────────┼──────────────────────────────────────────────────┤
+│ 2. F# View DSL Memory    │ Zero-AST CEs, Struct Builders, String Caching    │
+├──────────────────────────┼──────────────────────────────────────────────────┤
+│ 3. Blazor Diff Engine    │ Compile-Time Constant Sequences, Keyed Lists     │
+├──────────────────────────┼──────────────────────────────────────────────────┤
+│ 4. RazorConsole Pipeline │ Translation Caching, WidgetLayout, Cell Reuse    │
+└──────────────────────────┴──────────────────────────────────────────────────┘
+```
+
+---
+
+### 7.3 Elmish Dispatch & Frame Throttling
+
+In high-throughput TUIs (e.g., telemetry streaming, log tails, physics simulations, or rapid key repeat), messages can arrive at hundreds or thousands of events per second.
+
+#### Hazard: The Unthrottled Dispatch Trap
+In standard Elmish, every message processed by `Program.runWithDispatch` triggers `setState model dispatch`, which invokes `this.InvokeAsync(this.StateHasChanged)`. If 300 messages arrive in one second, Blazor will execute 300 diff and translation passes per second, overwhelming the CPU and causing severe frame queue lag.
+
+#### Optimization 1: Message Coalescing & Frame Throttling
+Decouple the Elmish `update` rate from the Blazor `render` rate:
+1. **Synchronous Model Updates:** Process `update` calls immediately as messages arrive so application state remains strictly sequential and responsive.
+2. **Throttled Render Signals:** Instead of calling `StateHasChanged()` on every message, use an animation frame timer (e.g. `PeriodicTimer` or high-resolution 16.6ms loop) or a dirty flag:
+   ```fsharp
+   let mutable isDirty = false
+   let mutable currentModel = initModel
+
+   let dispatch msg =
+       let newModel, cmd = update msg currentModel
+       currentModel <- newModel
+       isDirty <- true
+       executeCmd cmd
+
+   // Driven by 60 FPS tick (16.67ms) on the Blazor Dispatcher:
+   let onFrameTick () =
+       if isDirty then
+           isDirty <- false
+           component.TriggerStateHasChanged()
+   ```
+If 20 messages arrive within a single 16ms window, all 20 state transitions execute instantly in memory, but **only 1 DOM diff and 1 terminal render pass are executed**.
+
+#### Optimization 2: Subtree Memoization (`lazyView` / `lazyView2`)
+For complex screens, wrap expensive visual sub-sections in reference-equality guards:
+```fsharp
+let inline lazyView (viewFn: 'subModel -> Dispatch<'msg> -> Node) (subModel: 'subModel) (dispatch: Dispatch<'msg>) =
+    // If subModel is an immutable record that has not changed reference,
+    // emit the cached RenderTree nodes or skip evaluation.
+```
+
+---
+
+### 7.4 Zero-Allocation F# View DSL Design
+
+The biggest memory danger in an F# Elmish connector is creating intermediate heap allocations inside the `view` function.
+
+#### Hazard: Intermediate AST Allocation Churn
+If an F# DSL builds an abstract syntax tree of F# lists and union cases:
+```fsharp
+rows [] [
+    for item in model.Items ->
+        panel [ title item.Name ] [ markup item.Status ]
+]
+```
+On every 16ms tick, this allocates:
+- F# list nodes (`[ ... ]`) for children and attributes.
+- Discriminated union instances for every layout container.
+- Closure objects capturing loop indices.
+
+At 60 FPS, this produces continuous Gen 0 heap garbage that forces frequent GC collections.
+
+#### Optimization 1: Zero-AST Direct-Builder Computation Expressions
+Design the F# Computation Expression DSL so that `Yield`, `Combine`, and `Run` write **imperatively and directly into `RenderTreeBuilder`** without constructing intermediate data structures:
+
+```fsharp
+// Represent Node not as an allocated tree or delegate, but as a struct or unit action:
+[<Struct>]
+type ViewBuilder =
+    val Builder: RenderTreeBuilder
+    new (b: RenderTreeBuilder) = { Builder = b }
+
+type PanelBuilder() =
+    member inline _.Run([<InlineIfLambda>] f: RenderTreeBuilder -> unit) : (RenderTreeBuilder -> unit) =
+        fun tb ->
+            tb.OpenElement(0, "div")
+            tb.AddAttribute(1, "class", "panel")
+            tb.AddAttribute(2, "data-layout", "box")
+            f tb
+            tb.CloseElement()
+```
+Using `[<InlineIfLambda>]` and `struct` contexts completely eliminates heap allocations during tree evaluation.
+
+#### Optimization 2: String Allocation Caching
+Static strings and recurring labels should never be formatted or interpolated on the fly:
+* **Bad:** `tb.AddAttribute(seq, "data-expand", (if expand then "true" else "false"))` (allocates string references if not interned).
+* **Good:** Use static `readonly` string constants:
+  ```fsharp
+  module Attributes =
+      let [<Literal>] True = "true"
+      let [<Literal>] False = "false"
+      let [<Literal>] Box = "box"
+      let [<Literal>] Flex = "flex"
+      let [<Literal>] Rounded = "rounded"
+  ```
+* For dynamic numeric strings (e.g. counters, indices), consider using pre-formatted string caches or fixed formatters rather than generic string interpolation.
+
+#### Optimization 3: Event Callback Caching
+Attaching event handlers in a loop (e.g. `onClick (fun () -> dispatch (Select item.Id))`) allocates a new closure on every frame.
+* **Optimization:** In TUIs, user interaction is almost exclusively driven by terminal keyboard input. Rather than attaching 50 per-item DOM event handlers, route input through a centralized keyboard listener in the Elmish `Subscription` loop, updating a single `SelectedIndex` in the model.
+
+---
+
+### 7.5 Blazor Tree Diffing Mechanics
+
+Blazor's diffing algorithm operates under specific assumptions that F# code must respect:
+
+#### Optimization 1: Strict Compile-Time Sequence Numbers
+Sequence numbers in `RenderTreeBuilder` represent source-code positions, not runtime loop counters.
+* **Anti-pattern:** `tb.OpenElement(i * 10, "div")` (causes Blazor's diffing engine to allocate large sparse frame tables and prevents slot memoization).
+* **Correct:** Use constant sequence numbers per instruction:
+  ```fsharp
+  for item in items do
+      tb.OpenElement(0, "div")
+      tb.SetKey(box item.Id)
+      tb.AddAttribute(1, "class", "item")
+      tb.AddContent(2, item.Text)
+      tb.CloseElement()
+  ```
+
+#### Optimization 2: Mandatory Keying for Dynamic Collections (`SetKey`)
+Our benchmark demonstrated that keyed mutations (`SetKey`) allow Blazor to cleanly handle additions and removals in **17.87 μs**. Without keys, inserting an item at the head of a 50-item list forces Blazor to re-apply attribute and text edits across all 50 subsequent elements, triggering cascade mutations.
+
+#### Optimization 3: Attribute Order Stability
+Always emit attributes in the identical sequence order across frames. Blazor's diffing engine compares attribute frames linearly; stable ordering ensures $O(1)$ sequential matching rather than searching the frame window.
+
+---
+
+### 7.6 RazorConsole Downstream Pipeline Optimizations
+
+Because `CreateSnapshot()` and terminal I/O constitute the majority of real-world frame time, downstream optimizations yield dramatic returns:
+
+#### Optimization 1: Opt into the `WidgetLayout` Pipeline
+RazorConsole provides two rendering pipelines:
+* `RazorConsoleRenderingPipeline.LegacySpectre`: Re-translates VNodes directly into Spectre widgets and relies on string-based terminal rendering.
+* `RazorConsoleRenderingPipeline.WidgetLayout` (Default in modern versions): Uses `WidgetTranslationContext`, `LayoutEngine`, and `TerminalCanvas` to perform structural geometry calculations and cell-matrix rendering. Ensure this pipeline is active:
+  ```csharp
+  options.RenderingPipeline = RazorConsoleRenderingPipeline.WidgetLayout;
+  ```
+
+#### Optimization 2: Fixed Geometry to Maximize Terminal Cell Reuse
+Spectre's `DiffRenderable` compares the previous terminal character grid with the new grid, emitting ANSI sequences **only for modified cells**.
+* If an element's size oscillates or lines wrap dynamically, the entire terminal below that point reflows, forcing hundreds of ANSI escape sequences to be emitted.
+* By using fixed `width`, fixed `height`, and clipped padding on dynamic labels (e.g. `width 20`), layout dimensions remain constant. Updating a single label changes only ~5–10 character cells in the terminal buffer, reducing terminal I/O to a few dozen bytes per frame.
+
+#### Optimization 3: Alternate Screen Buffer & Cursor Suppression
+Always configure:
+```csharp
+options.ConsoleLiveDisplayOptions.UseAlternateScreenBuffer = true;
+options.ConsoleLiveDisplayOptions.HideCursor = true;
+```
+This routes rendering to the terminal's alternate screen buffer and suppresses cursor repositioning noise, avoiding terminal emulator flicker during 60 FPS update loops.
+
+---
+
+## 8. Primary Source Citation Index
 
 | Repository | File Path | Line Range | Cited Entity / Subject |
 | :--- | :--- | :--- | :--- |
+| **Benchmark** | `/tmp/scratch_benchmark/Program.cs` | 1–400 | Empirical benchmark harness measuring PureBlazor vs ConsoleRenderer |
 | **Elmish** | `src/program.fs` | 12–20 | `type Program<'arg, 'model, 'msg, 'view>` definition |
 | **Elmish** | `src/program.fs` | 27–38 | `Program.mkProgram` and default `setState` definition |
 | **Elmish** | `src/program.fs` | 160–203 | `Program.runWithDispatch` loop, message queue, and `setState` invocation |
