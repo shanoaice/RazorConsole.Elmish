@@ -1,8 +1,7 @@
 <Solution>
-  <Folder Name="/benchmarks/">
-    <Project Path="benchmarks/RazorConsole.Elmish.Benchmarks/RazorConsole.Elmish.Benchmarks.fsproj" />
+  <Folder Name="/docs/">
+    <File Path="docs/research/elmish_razorconsole_architecture.md" />
   </Folder>
-  <Folder Name="/src/">
-    <Project Path="src/RazorConsole.Elmish.fsproj" />
-  </Folder>
+  <Project Path="benchmarks/RazorConsole.Elmish.Benchmarks.fsproj" />
+  <Project Path="src/RazorConsole.Elmish.fsproj" />
 </Solution>
