@@ -59,3 +59,7 @@ nunit-*.xml
 .kilo
 
 .fake
+
+# nuclear option
+# I would rather not include it
+.idea
